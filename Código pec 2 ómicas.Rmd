@@ -1,0 +1,965 @@
+---
+title: "Análisis de datos ómicos - PEC 2"
+author: "Emilio Alarcón Martín"
+date: '`r format(Sys.Date(),"%e de %B, %Y")`'
+output:
+  prettydoc::html_pretty:
+    highlight: github
+    number_sections: yes
+    theme: cayman
+    toc: yes 
+    fig_caption: true 
+  html_document:
+    df_print: paged
+    toc_float: true
+    toc: yes
+    toc_depth: 4
+    theme: united
+    highlight: tango
+  pdf_document:
+    keep_tex: yes
+    toc: yes
+    toc_depth: 4
+lang: es  # es: español
+---
+
+```{r setup, include=FALSE}
+require(knitr)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, 
+                      comment = NA, prompt = TRUE, tidy = FALSE, 
+                      fig.width = 11, fig.height = 7, fig_caption = TRUE,
+                      cache=FALSE)
+Sys.setlocale("LC_TIME", "C")
+```
+
+```{r prep dir, include=FALSE} 
+setwd("C:/Users/Emilio/Desktop/PEC 2 - Ómicas Junio 2020")
+```
+
+```{r installPackages, message=FALSE, warning=FALSE, , echo = FALSE}
+if(!require(org.Hs.eg.db)) BiocManager::install("org.Hs.eg.db")
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install()
+
+
+libraries <- c("readxl",
+               "plyr",
+               "dplyr",
+               "ggpubr",
+               "stringr", 
+               "tidyverse",
+               "DESeq2",
+               "GenomicAlignments",
+               "ggbeeswarm",
+               "pheatmap",
+               "RColorBrewer",
+               "kableExtra", 
+               "apeglm",
+               "AnnotationDbi",
+               "clusterProfiler")
+
+check.libraries <- is.element(libraries, installed.packages()[, 1])==FALSE
+libraries.to.install <- libraries[check.libraries]
+if (length(libraries.to.install!=0)) {
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install(libraries.to.install)
+}
+
+for (i in libraries) {
+  library(i, character.only = TRUE)
+}
+
+
+
+```
+
+# Abstract
+
+En este trabajo se lleva a cabo un análisis estadístico a partir de información de las muestras de un estudio obtenido del repositorio GTEx. Este repositorio contiene datos de múltiples tipos en un total de 54 tejidos. Nos centraremos en los datos de expresión (RNA-seq) pertenecientes a un análisis del tiroides según tipo de infiltración:
+
+* Not infiltrated tissues (NIT)
+* Small focal infiltrates (SFI)
+* Extensive lymphoid infiltrates (ELI)
+
+# Objetivos
+
+El principal objetivo de este trabajo es obtener un listado de genes que que se expresan más ampliamente diferenciados en tiroides, generar una lista de los más diferenciados (ordenados por p-valor) y se muestran las vías metabólicas en los que dichos genes se encuentran implicados.
+
+
+# Materiales y Métodos 
+## Datos
+```{r , include=FALSE} 
+
+# Leer los datos de la PEC
+counts <- read.csv2("C:/Users/Emilio/Desktop/PEC 2 - Ómicas Junio 2020/archivos targets y counts/counts.csv")
+
+targets <- read.csv("C:/Users/Emilio/Desktop/PEC 2 - Ómicas Junio 2020/archivos targets y counts/targets.csv")
+```
+
+Partimos de una tabla *targets*, de **`r dim(counts)[1]` filas y `r dim(counts)[2]` columnas** y otra *counts* de **`r dim(targets)[1]` filas y `r dim(targets)[2]` columnas**. Un vistazo rápido a las tablas para tener una estimación visual: 
+
+```{r } 
+
+print(head(targets))
+print(counts[1:10,1:2])
+
+```
+
+Solo será necesario trabajar con 10 muestras de cada grupo, por lo que se realizará una filtración aleatoria de la tabla *targets* que luego se aplicará a la tabla *counts*. Aunque los nombres de las muestras son similares, en un caso contienen **"-"** y en otros **"."**. Por ello, sustituiremos en la tabla *targets* un carácter por otro. 
+
+**NOTA:** No tenemos información de si existen diferencias entre los datos de la variable `molecular_data_type` cuyas opciones son Allele-Specific Expression, RNA Seq (NGS). Ante la duda de cuál de los dos tomar, se ha decidido usarlas de forma indistinta.
+
+```{r , include = FALSE} 
+
+# Seleccionar de forma aleatoria 10 de cada grupo
+set.seed(10031994)
+new_targets <- targets
+new_targets <- new_targets %>% group_by(Group) %>% sample_n(10)
+
+#Cambiamos el - por el .
+new_targets$Sample_Name <- str_replace_all(new_targets$Sample_Name, "-", '\\.')
+
+
+#Seleccionamos los datos de counts desde targets
+new_counts <- counts[,c(which(colnames(counts) %in% new_targets$Sample_Name))]
+rownames(new_counts) <- counts$X
+
+#Ordenamos los datos de ambas tablas 
+new_counts <- new_counts[,sort(colnames(new_counts))]
+new_targets <- new_targets[order(new_targets$Sample_Name),]
+
+
+# Los nombres de los genes tienen un "extra" que sobra
+# Cortamos a partir del "."
+rownames(new_counts) <- gsub("\\..*", "", rownames(new_counts), fixed = FALSE)
+
+
+
+```
+
+```{r, echo = FALSE}
+print(head(new_targets))
+print(new_counts[1:10,1:2])
+```
+
+## Software
+
+### Versión de R 
+
+El informe se ha generado con Rmarkdown, a continuación se muestra la información de la sesión.
+```{r, echo = FALSE}
+sessionInfo()
+```
+
+
+### Repositorio en Github 
+
+Toda la información de la PEC (en este caso las dos tablas de entrada, el código de Rmarkdown y la exportación a HTML) se encuentran en [este link a github](https://github.com/Alarcon-Martin-E/PEC2_Analisis_Omicos).
+
+# Resultados
+
+## Análisis exploratorio
+
+Como los datos ya están en un formato cómodo, vamos simplemente a mostrar un ejemplo de cómo se encuentran los contajes para una muestra concreta, con el objetivo de verificar que tiene la información estándar de estos datos.
+
+```{r , echo = FALSE} 
+
+# Seleccionamos la primera muestra
+muestra1 <- colnames(new_counts)[1]
+muestra1chr <- as.character(muestra1)
+
+# Histograma de contajes crudos
+gg1 <- ggplot(new_counts, aes(x=new_counts[,1])) + 
+  xlab(paste("Muestra", muestra1chr, sep =" ")) +
+  geom_histogram(colour = "#1F3552", fill = "#4271AE")+
+      theme(
+      plot.title = element_text(size=15)
+    ) +
+  ggtitle("Datos sin transformar")
+
+# Histograma de contajes transformados     
+gg2 <- ggplot(new_counts, aes(x= log2(new_counts[,1] + 1))) +
+  xlab(paste("Muestra", muestra1chr, sep =" ")) +
+  ylab(expression(log[2](counts + 1))) + 
+  geom_histogram(colour = "#1F3552", fill = "#4271AE") + 
+  ggtitle("Datos transformados")
+
+# Representación de paralelo de ambos
+ggarrange(gg1, gg2, ncol = 2)
+
+```
+
+Como era de esperar, la gran mayoría de contajes tienen valor 0. Estos genes no resultan informativos y pueden ser un problema en el análisis posterior, por ejemplo cuando ajustamos los p-valores con el objetivo de controlar el ratio de falsos positivos (FDR), ya que perderemos potencia en los tests debido a la gran cantidad de genes para los que no existe diferenciación. Por ello, convendrá llevar a cabo algún tipo de filtrado, por ejemplo teniendo en cuenta el tamaño de la muestra mediante la función `results()` del paquete `DESeq2`, que calcula por sí misma el valor CPM mínimo (cutoff). 
+
+## Eliminación de genes que no están expresados
+
+```{r , echo = FALSE} 
+
+# Construimos el objeto DESeqDataSet 
+dds <- DESeqDataSetFromMatrix(new_counts, DataFrame(new_targets), ~ Group)
+
+# Eliminamos las filas vacías
+dds2 <- dds[ rowSums(counts(dds)) > 1, ]
+
+```
+
+Nuestra matriz de datos presentaba inicialmente **`r nrow(dds)` genes** y tras eliminar las filas nulas para a **`r nrow(dds2)` genes**. Esto agilizará los algoritmos. 
+
+
+## Opciones para estabilizar la varianza y PCA
+
+Previo a un análisis de PCA, es conveniente controlar la varianza de la muestra, ya que funcionan mejor en situación cercana a la homocedasticidad. Esto puede suponer un problema en los recuentos de ARN-seq, pues la varianza esperada crece con la media. El paquete `DESeq2` ofrece dos transformaciones distintas: 
+
+* VST: Más rápida, pensada para conjunto de datos > 30 muestras
+* Rlog: Más lento, pensado para conjunto de datos < 30 muestras
+
+En común, ambas generan una información similar al log2 ordinario en recuentos normalizados pero no para recuentos más bajos. Además, ambas generan un objeto `DESeqTransform`. Procederemos a comparar los resultados de las tres transformaciones.
+
+```{r , echo = FALSE} 
+
+# Transformación 1 
+vsd <- vst(dds2, blind = FALSE)
+
+# Transformación 2 
+rld <- rlog(dds2, blind = FALSE)
+
+# Transformación 3
+dds3 <- estimateSizeFactors(dds2)
+
+# Fusión de los datos para representarlos
+df <- bind_rows(
+  as_data_frame(log2(counts(dds3, normalized=TRUE)[, 1:2]+1)) %>%
+         mutate(transformation = "log2(x + 1)"),
+  as_data_frame(assay(vsd)[, 1:2]) %>% mutate(transformation = "vst"),
+  as_data_frame(assay(rld)[, 1:2]) %>% mutate(transformation = "rlog"))
+
+colnames(df)[1:2] <- c("x", "y")  
+
+# Representación de las tres transformaciones
+ggplot(df, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation)  
+
+```
+
+Por rapidez de las muestras, se trabajará con la transformación de la función `STV` al ser más rápida y nuestra muestra tener un tamaño intermedio. Esta transformación SOLO SE EMPLEARÁ PARA EL PCA. Según la información de vignettes del paquete `DESeq2` *"The variance stabilizing and rlog transformations are provided for applications other than differential testing, for example clustering of samples or other machine learning applications. For differential testing we recommend the DESeq function applied to raw counts."*
+
+```{r, echo = FALSE}
+
+# Calculo de distancias
+sampleDists <- dist(t(assay(vsd)))
+
+# Crear la matriz de distancias 
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) <- paste( vsd$dex, vsd$cell, sep = " - " )
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+
+# Representación del heat map
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+
+# Representación de los dos primeros PCA
+plotPCA(vsd, intgroup = "Group")
+
+```
+
+A simple vista no parece haber una separación completa de las muestras, pero los valores de ELI parecen estar en su mayoría separados por los valores positivos del PC1, mientras que existe cierta separación entre NIT y SFI en función del PC2. Esto podría sugerir realizar un análisis SFI & NIT vs ELI (sin infiltración o infiltración suave vs infiltración grave), este planteamiento tendría cierta lógica en cuanto a que desde que ocurre un evento hasta que se muestran cambios de expresión puede haber un desfase. Sin embargo, como no se especifica en el enunciado y este ejercicio busca simplemente trabajar con las herramientas más que sacar conclusiones de los datos, no se aplicará este enfoque.  
+
+
+##  Normalizar con DeSeq y expresión diferencial
+
+El primer paso para normalizar nuestros datos pasa por ejecutar la función `DESeq()` sobre nuestro objeto de la clase `DESeqDataSet`. Esta función lleva a cabo un análisis que incluye los pasos de _estimation of size factors_, _estimation of dispersion_ y _Negative Binomial GLM fitting and Wald statistics_, tal como se explica en su documentación y se muestra en el propio output de su llamada. Por tanto, partiremos de la versión del objeto `dds` con el que entramos al apartado anterior (dds2).
+
+La función `results` que realiza el cálculo requiere el parámetro `contrast`, el cual SOLO ACEPTA DOS ELEMENTOS A COMPARAR. como tenemos tres grupos (NIT,SFI y ELI) se realizarán 3 pruebas: 
+
+* NS: NIT vs SFI 
+* NE: NIT vs ELI
+* SE: SFI vs ELI
+
+### NIT vs SFI 
+
+A continuación, se muestran la información del objeto `DESeqResults`, tanto de las columnas que lo forman como de un sumario estadístico. 
+
+```{r, echo = FALSE}
+
+# Normalización para la expresión diferencial
+dds4 <- DESeq(dds2, parallel = TRUE)
+
+# Cálculo diferencial de A vs B 
+res_NS <- results(dds4, contrast = c("Group","NIT", "SFI"))
+
+mcols(res_NS, use.names = TRUE)
+summary(res_NS)
+
+```
+
+A partir de aquí se pueden representar el conjunto total de genes obtenidos en el análisis de expresión diferencial con un volcano plot. En
+este gráfico se han señalado los genes DE con un p.valor ajustado < 0.1 y un valor absoluto logFC > 2. Se ha elegido un valor de p.valor relativamente laxo ya que son muy pocos los genes diferencialmente expresados.
+
+```{r, echo = FALSE}
+
+#### Graficar el volcano
+fc_cutoff_NS   <- 2
+padj_cutoff_NS <- 0.1
+
+plot(res_NS$log2FoldChange, -log10(res_NS$padj), 
+     cex = 0.5, xlab = "log2 fold change (NIT vs SFI)", ylab = "p-value (-log10)", 
+     col = alpha("black", 0.2), pch = 19)
+
+# Down-regulated genes (red)
+with(subset(res_NS, padj < padj_cutoff_NS & log2FoldChange < -fc_cutoff_NS),
+     points(log2FoldChange, -log10(padj), pch = 20, col = alpha("blue", 0.2)))
+
+# Up-regulated genes (blue)
+with(subset(res_NS, padj < padj_cutoff_NS & log2FoldChange > fc_cutoff_NS),
+     points(log2FoldChange, -log10(padj), pch = 20, col = "red"))
+
+abline(v = fc_cutoff_NS, col = "red")
+abline(v = -fc_cutoff_NS, col = "blue")
+
+```
+
+Con esta información podemos plantearnos qué genes concretos queremos ver (en algunos casos según muchos como para mostrarlos todos). En principio no aplicaremos filtro por *log2FoldChange*, pues cualquier efecto, por pequeño que sea, podría ser interesante introducirlo. Ya a posteriori el investigador que analice los resultados puede proponer un filtro más estricto y tener en cuenta solo aquellos que presenten un cambio drástico. 
+
+
+```{r, echo = FALSE}
+
+# Filtraje solo por los estadísticamente significativos (filtro amplio)
+resSig_NS <- subset(res_NS, padj < 0.1)
+
+# Selección de genes down
+genes_down_NS <- subset(resSig_NS,  log2FoldChange < 0)
+genes_down_NS <- genes_down_NS[order(genes_down_NS$log2FoldChange), ]
+genes_down_ids_NS <- row.names(genes_down_NS)
+
+### Tabla 1 
+kable(head(genes_down_NS), booktabs = TRUE, digits = 6, linesep = "", 
+      caption = "Muestra de algunos genes infraexpresados (genes\\_down)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = TRUE) %>% 
+  column_spec(1, width = "3cm") %>% 
+  row_spec(0, bold = TRUE)
+
+# Selección de genes up
+genes_up_NS <- subset(resSig_NS,  log2FoldChange > 0)
+genes_up_NS <- genes_up_NS[order(genes_up_NS$log2FoldChange, 
+                                 decreasing = TRUE), ]
+genes_up_ids_NS <- row.names(genes_up_NS)
+
+### Tabla 2
+kable(head(genes_up_NS), booktabs = TRUE, digits = 6, linesep = "", 
+      caption = "Muestra de algunos genes sobreexpresados (genes\\_up)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = TRUE) %>% 
+  column_spec(1, width = "3cm") %>% 
+  row_spec(0, bold = TRUE)
+
+```
+
+Podrían aplicarse filtros más estrictos, como pueda ser bajar el *FDR* (False Discover Rate) o subiendo el *log2 fold change*. Como el número de genes expresados de forma diferencial es bastante bajo **(`r nrow(resSig_NS)` genes en total, `r nrow(genes_down_NS)` down y `r nrow(genes_up_NS)` up**) no vamos a aplicar nigún recorte.
+
+Otra de las opciones a comentar es que existe un elevado número de *low counts*, por lo que se podrían repetir los resultados pasando el objeto dds por la función `lfcShrink()`. El objetivo de esto sería ajustar los _fold change_ cuando el número de _reads_ es bajo. Esta función utiliza la información de todos los genes para generar una estimación más precisa de dicho _fold change_, de modo que aquellos genes con poca información o dispersión alta vean reducido su _fold change_ calculado. Para agilizar el proceso, tampoco va a aplicarse este enfoque, pero es conveniente comentar su existencia en caso de buscar un análisis más exhaustivo.
+
+### NIT vs ELI
+
+A continuación, se muestran la información del objeto `DESeqResults`, tanto de las columnas que lo forman como de un sumario estadístico. 
+
+```{r, echo = FALSE}
+
+# Cálculo diferencial de A vs B 
+res_NE <- results(dds4, contrast = c("Group","NIT", "ELI"))
+
+mcols(res_NE, use.names = TRUE)
+summary(res_NE)
+
+```
+
+A partir de aquí se pueden representar el conjunto total de genes obtenidos en el análisis de expresión diferencial con un volcano plot. En este gráfico se han señalado los genes con un p.valor ajustado < 0.01 y un valor absoluto logFC > 2. 
+
+```{r, echo = FALSE}
+
+#### Graficar el volcano
+fc_cutoff_NE   <- 2
+padj_cutoff_NE <- 0.01
+
+plot(res_NE$log2FoldChange, -log10(res_NE$padj), 
+     cex = 0.5, xlab = "log2 fold change (NIT vs ELI)", ylab = "p-value (-log10)", 
+     col = alpha("black", 0.2), pch = 19)
+
+# Down-regulated genes (red)
+with(subset(res_NE, padj < padj_cutoff_NE & log2FoldChange < -fc_cutoff_NE),
+     points(log2FoldChange, -log10(padj), pch = 20, col = alpha("blue", 0.2)))
+
+# Up-regulated genes (blue)
+with(subset(res_NE, padj < padj_cutoff_NE & log2FoldChange > fc_cutoff_NE),
+     points(log2FoldChange, -log10(padj), pch = 20, col = "red"))
+
+abline(v = fc_cutoff_NE, col = "red")
+abline(v = -fc_cutoff_NE, col = "blue")
+
+```
+
+Con esta información podemos plantearnos qué genes concretos queremos ver (en algunos casos según muchos como para mostrarlos todos). En principio no aplicaremos filtro por *log2FoldChange*, pues cualquier efecto, por pequeño que sea, podría ser interesante introducirlo. Ya a posteriori el investigador que analice los resultados puede proponer un filtro más estricto y tener en cuenta solo aquellos que presenten un cambio drástico. 
+
+
+```{r, echo = FALSE}
+
+# Filtraje solo por los estadísticamente significativos (filtro amplio)
+resSig_NE <- subset(res_NE, padj < 0.01)
+
+# Selección de genes down
+genes_down_NE <- subset(resSig_NE,  log2FoldChange < 0)
+genes_down_NE <- genes_down_NE[order(genes_down_NE$log2FoldChange), ]
+genes_down_ids_NE <- row.names(genes_down_NE)
+
+### Tabla 1 
+kable(head(genes_down_NE), booktabs = TRUE, digits = 6, linesep = "", 
+      caption = "Muestra de algunos genes infraexpresados (genes\\_down)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = TRUE) %>% 
+  column_spec(1, width = "3cm") %>% 
+  row_spec(0, bold = TRUE)
+
+# Selección de genes up
+genes_up_NE <- subset(resSig_NE,  log2FoldChange > 0)
+genes_up_NE <- genes_up_NE[order(genes_up_NE$log2FoldChange, 
+                                 decreasing = TRUE), ]
+genes_up_ids_NE <- row.names(genes_up_NE)
+
+### Tabla 2
+kable(head(genes_up_NE), booktabs = TRUE, digits = 6, linesep = "", 
+      caption = "Muestra de algunos genes sobreexpresados (genes\\_up)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = TRUE) %>% 
+  column_spec(1, width = "3cm") %>% 
+  row_spec(0, bold = TRUE)
+
+```
+
+Podrían aplicarse filtros más estrictos, como pueda ser bajar el *FDR* (False Discover Rate) o subiendo el *log2 fold change*. En este caso, se han detectado **`r nrow(resSig_NE)` genes en total, `r nrow(genes_down_NE)` down y `r nrow(genes_up_NE)` up**.
+
+Otra de las opciones a comentar es que existe un elevado número de *low counts*, por lo que se podrían repetir los resultados pasando el objeto dds por la función `lfcShrink()`. El objetivo de esto sería ajustar los _fold change_ cuando el número de _reads_ es bajo. Esta función utiliza la información de todos los genes para generar una estimación más precisa de dicho _fold change_, de modo que aquellos genes con poca información o dispersión alta vean reducido su _fold change_ calculado. Para agilizar el proceso, tampoco va a aplicarse este enfoque, pero es conveniente comentar su existencia en caso de buscar un análisis más exhaustivo.
+
+### SFI vs ELI
+
+A continuación, se muestran la información del objeto `DESeqResults`, tanto de las columnas que lo forman como de un sumario estadístico. 
+
+```{r, echo = FALSE}
+
+
+# Cálculo diferencial de A vs B 
+res_SE <- results(dds4, contrast = c("Group","SFI", "ELI"))
+
+mcols(res_SE, use.names = TRUE)
+summary(res_SE)
+
+```
+
+A partir de aquí se pueden representar el conjunto total de genes obtenidos en el análisis de expresión diferencial con un volcano plot. En
+este gráfico se han señalado los genes con un p.valor ajustado < 0.01 y un valor absoluto logFC > 2. 
+
+```{r, echo = FALSE}
+
+#### Graficar el volcano
+fc_cutoff_SE  <- 2
+padj_cutoff_SE <- 0.01
+
+plot(res_SE$log2FoldChange, -log10(res_SE$padj), 
+     cex = 0.5, xlab = "log2 fold change (SFI vs ELI)", ylab = "p-value (-log10)", 
+     col = alpha("black", 0.2), pch = 19)
+
+# Down-regulated genes (red)
+with(subset(res_SE, padj < padj_cutoff_SE & log2FoldChange < -fc_cutoff_SE),
+     points(log2FoldChange, -log10(padj), pch = 20, col = alpha("blue", 0.2)))
+
+# Up-regulated genes (blue)
+with(subset(res_SE, padj < padj_cutoff_SE & log2FoldChange > fc_cutoff_SE),
+     points(log2FoldChange, -log10(padj), pch = 20, col = "red"))
+
+abline(v = fc_cutoff_SE, col = "red")
+abline(v = -fc_cutoff_SE, col = "blue")
+
+```
+
+Con esta información podemos plantearnos qué genes concretos queremos ver (en algunos casos según muchos como para mostrarlos todos). En principio no aplicaremos filtro por *log2FoldChange*, pues cualquier efecto, por pequeño que sea, podría ser interesante introducirlo. Ya a posteriori el investigador que analice los resultados puede proponer un filtro más estricto y tener en cuenta solo aquellos que presenten un cambio drástico. 
+
+
+```{r, echo = FALSE}
+
+# Filtraje solo por los estadísticamente significativos (filtro amplio)
+resSig_SE <- subset(res_SE, padj < 0.01)
+
+# Selección de genes down
+genes_down_SE <- subset(resSig_SE,  log2FoldChange < 0)
+genes_down_SE <- genes_down_SE[order(genes_down_SE$log2FoldChange), ]
+genes_down_ids_SE <- row.names(genes_down_SE)
+
+### Tabla 1 
+kable(head(genes_down_SE), booktabs = TRUE, digits = 6, linesep = "", 
+      caption = "Muestra de algunos genes infraexpresados (genes\\_down)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = TRUE) %>% 
+  column_spec(1, width = "3cm") %>% 
+  row_spec(0, bold = TRUE)
+
+# Selección de genes up
+genes_up_SE <- subset(resSig_SE,  log2FoldChange > 0)
+genes_up_SE <- genes_up_SE[order(genes_up_SE$log2FoldChange, 
+                                 decreasing = TRUE), ]
+genes_up_ids_SE <- row.names(genes_up_SE)
+
+### Tabla 2
+kable(head(genes_up_SE), booktabs = TRUE, digits = 6, linesep = "", 
+      caption = "Muestra de algunos genes sobreexpresados (genes\\_up)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = TRUE) %>% 
+  column_spec(1, width = "3cm") %>% 
+  row_spec(0, bold = TRUE)
+
+```
+
+Podrían aplicarse filtros más estrictos, como pueda ser bajar el *FDR* (False Discover Rate) o subiendo el *log2 fold change*. En este caso, se han detectado **`r nrow(resSig_SE)` genes en total, `r nrow(genes_down_SE)` down y `r nrow(genes_up_SE)` up**.
+
+Otra de las opciones a comentar es que existe un elevado número de *low counts*, por lo que se podrían repetir los resultados pasando el objeto dds por la función `lfcShrink()`. El objetivo de esto sería ajustar los _fold change_ cuando el número de _reads_ es bajo. Esta función utiliza la información de todos los genes para generar una estimación más precisa de dicho _fold change_, de modo que aquellos genes con poca información o dispersión alta vean reducido su _fold change_ calculado. Para agilizar el proceso, tampoco va a aplicarse este enfoque, pero es conveniente comentar su existencia en caso de buscar un análisis más exhaustivo.
+
+
+## Anotación de genes 
+
+El primer paso para llevar a cabo el proceso de anotación de resultados consiste en identificar y cargar la librería con la base de datos que se corresponde con el genoma utilizado en nuestro estudio. En este caso se trata del hg18, pero como quiera que los identificadores ENSG son estables, es posible trabajar con el paquete `org.Hs.eg.db` correspondiente al organismo _Homo sapiens_ (`Hs`) y _Entrez gene ids_ (`eg`).
+
+Por algún motivo, existe una gran cantidad de datos que no existen en el paquete; `r table(rownames(new_counts) %in% keys(org.Hs.eg.db, keytype = "ENSEMBL"))[1]` ausentes frente a `r table(rownames(new_counts) %in% keys(org.Hs.eg.db, keytype = "ENSEMBL"))[2]` presentes. Por esto las tablas que se muestran serán, ordenadas por la magnitud de efecto, las primeras que tengan asociación. 
+
+### NIT vs SFI 
+
+```{r,  echo = FALSE}
+
+# Opciones del paquete
+columns(org.Hs.eg.db)
+
+# Mostrar los up-regulated
+genes_up_annotated_NS <- AnnotationDbi::select(org.Hs.eg.db, keys = genes_up_ids_NS, keytype = "ENSEMBL", 
+                             columns = c("ENSEMBL","SYMBOL", "GENENAME" , "ENTREZID"))
+
+kable(head(subset( genes_up_annotated_NS, !is.na(GENENAME))), booktabs = TRUE, digits = 6, linesep = "", 
+      caption = "Muestra de algunos genes sobreexpresados (genes\\_up)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = TRUE) %>% 
+  column_spec(1, width = "3cm") %>% 
+  row_spec(0, bold = TRUE)
+
+
+# Mostrar los down-regulated
+genes_down_annotated_NS <- AnnotationDbi::select(org.Hs.eg.db, keys = genes_down_ids_NS, keytype = "ENSEMBL", 
+                             columns = c("ENSEMBL","SYMBOL", "GENENAME" , "ENTREZID"))
+
+kable(head(subset( genes_down_annotated_NS, !is.na(GENENAME))), booktabs = TRUE, digits = 6, linesep = "", 
+      caption = "Muestra de algunos genes infraexpresados (genes\\_down)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = TRUE) %>% 
+  column_spec(1, width = "3cm") %>% 
+  row_spec(0, bold = TRUE)
+
+```
+
+### NIT vs ELI
+
+```{r,  echo = FALSE}
+
+# Opciones del paquete
+columns(org.Hs.eg.db)
+
+# Mostrar los up-regulated
+genes_up_annotated_NE <- AnnotationDbi::select(org.Hs.eg.db, keys = genes_up_ids_NE, keytype = "ENSEMBL", 
+                             columns = c("ENSEMBL","SYMBOL", "GENENAME",  "ENTREZID"))
+
+kable(head(subset( genes_up_annotated_NE, !is.na(GENENAME))), booktabs = TRUE, digits = 6, linesep = "", 
+      caption = "Muestra de algunos genes sobreexpresados (genes\\_up)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = TRUE) %>% 
+  column_spec(1, width = "3cm") %>% 
+  row_spec(0, bold = TRUE)
+
+
+# Mostrar los down-regulated
+genes_down_annotated_NE <- AnnotationDbi::select(org.Hs.eg.db, keys = genes_down_ids_NE, keytype = "ENSEMBL", 
+                             columns = c("ENSEMBL","SYMBOL", "GENENAME",  "ENTREZID"))
+
+kable(head(subset( genes_down_annotated_NE, !is.na(GENENAME))), booktabs = TRUE, digits = 6, linesep = "", 
+      caption = "Muestra de algunos genes infraexpresados (genes\\_down)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = TRUE) %>% 
+  column_spec(1, width = "3cm") %>% 
+  row_spec(0, bold = TRUE)
+
+```
+
+### SFI vs ELI
+
+```{r,  echo = FALSE}
+
+# Opciones del paquete
+columns(org.Hs.eg.db)
+
+# Mostrar los up-regulated
+genes_up_annotated_SE <- AnnotationDbi::select(org.Hs.eg.db, keys = genes_up_ids_SE, keytype = "ENSEMBL", 
+                             columns = c("ENSEMBL","SYMBOL", "GENENAME", "ENTREZID"))
+
+kable(head(subset( genes_up_annotated_SE, !is.na(GENENAME))), booktabs = TRUE, digits = 6, linesep = "", 
+      caption = "Muestra de algunos genes sobreexpresados (genes\\_up)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = TRUE) %>% 
+  column_spec(1, width = "3cm") %>% 
+  row_spec(0, bold = TRUE)
+
+
+# Mostrar los down-regulated
+genes_down_annotated_SE <- AnnotationDbi::select(org.Hs.eg.db, keys = genes_down_ids_SE, keytype = "ENSEMBL", 
+                             columns = c("ENSEMBL","SYMBOL", "GENENAME", "ENTREZID"))
+
+kable(head(subset( genes_down_annotated_SE, !is.na(GENENAME))), booktabs = TRUE, digits = 6, linesep = "", 
+      caption = "Muestra de algunos genes infraexpresados (genes\\_down)") %>%
+  kable_styling(latex_options = c("striped", "hold_position"), full_width = TRUE) %>% 
+  column_spec(1, width = "3cm") %>% 
+  row_spec(0, bold = TRUE)
+
+```
+
+
+## Análisis de significación biológica
+
+En este análisis de significación biológica se ha utilizado GO BP (gene ontology, biological process) para el conjunto de genes obtenidos en DESeq2.
+
+- El primer gráfico ilustrará las funciones genéricas en las que participan el conjunto de genes.
+
+- El segundo y el tercero serán representación de los procesos biológicos específicos en los que participa este conjunto.
+
+Por cada comparación, tendremos DOS grupos, los up-regulated y los down-regulated.
+
+
+### NIT vs SFI
+
+
+#### Up-regulated
+
+```{r, echo = FALSE}
+
+# Up-regulated - groupGO
+genes_up_annotated_NS_go <- as.character(
+  na.omit(genes_up_annotated_NS$ENTREZID))
+
+ggo_up_NS <- clusterProfiler::groupGO(gene = genes_up_annotated_NS_go,
+                                OrgDb = org.Hs.eg.db ,
+                                ont = "BP",
+                                level = 3,
+                                readable = TRUE)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de barras con las funciones genéricas sobreexpresadas en NIT vs SFI con groupGO()."}
+
+barplot(ggo_up_NS, drop=TRUE, showCategory=12)
+
+```
+
+```{r, echo = FALSE}
+
+# Up-regulated - enrichGO
+ego_up_NS <- clusterProfiler::enrichGO(
+                                 gene = genes_up_annotated_NS_go,
+                                 OrgDb = org.Hs.eg.db,
+                                 ont = "BP",
+                                 pAdjustMethod = "BH",
+                                 pvalueCutoff = 0.05,
+                                 qvalueCutoff = 0.05, 
+                                 readable = TRUE)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de barras con las funciones genéricas sobreexpresadas en NIT vs SFI con enrichGO()."}
+
+barplot(ego_up_NS, showCategory = 18, cex.names = 0.06)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de puntos con las funciones genéricas sobreexpresadas en NIT vs SFI con enrichGO()."}
+
+clusterProfiler::dotplot(ego_up_NS, showCategory = 18)
+
+```
+
+#### Down-regulated
+
+```{r, echo = FALSE}
+
+# down-regulated
+
+genes_down_annotated_NS_go <- as.character(
+  na.omit(genes_down_annotated_NS$ENTREZID))
+
+ggo_down_NS <- clusterProfiler::groupGO(gene = genes_down_annotated_NS_go,
+                                OrgDb = org.Hs.eg.db ,
+                                ont = "BP",
+                                level = 3,
+                                readable = TRUE)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de barras con las funciones genéricas infraexpresadas en NIT vs SFI con groupGO()."}
+
+barplot(ggo_down_NS, drop=TRUE, showCategory=12)
+
+```
+
+```{r, echo = FALSE}
+
+ego_down_NS <- clusterProfiler::enrichGO(
+                                 gene = genes_down_annotated_NS_go,
+                                 OrgDb = org.Hs.eg.db,
+                                 ont = "BP",
+                                 pAdjustMethod = "BH",
+                                 pvalueCutoff = 0.05,
+                                 qvalueCutoff = 0.05, 
+                                 readable = TRUE)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de barras con las funciones genéricas infraexpresadas en NIT vs SFI con enrichGO()."}
+
+barplot(ego_down_NS, showCategory = 18, cex.names = 0.06)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de puntos con las funciones genéricas infraexpresadas en NIT vs SFI con enrichGO()."}
+
+clusterProfiler::dotplot(ego_down_NS, showCategory = 18)
+
+```
+
+
+### NIT vs ELI
+
+#### Up-regulated
+
+```{r, echo = FALSE}
+
+# Up-regulated - groupGO
+genes_up_annotated_NE_go <- as.character(
+  na.omit(genes_up_annotated_NE$ENTREZID))
+
+ggo_up_NE <- clusterProfiler::groupGO(gene = genes_up_annotated_NE_go,
+                                OrgDb = org.Hs.eg.db ,
+                                ont = "BP",
+                                level = 3,
+                                readable = TRUE)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de barras con las funciones genéricas sobreexpresadas en NIT vs ELI con groupGO()."}
+
+barplot(ggo_up_NE, drop=TRUE, showCategory=12)
+
+```
+
+```{r, echo = FALSE}
+
+# Up-regulated - enrichGO
+ego_up_NE <- clusterProfiler::enrichGO(
+                                 gene = genes_up_annotated_NE_go,
+                                 OrgDb = org.Hs.eg.db,
+                                 ont = "BP",
+                                 pAdjustMethod = "BH",
+                                 pvalueCutoff = 0.05,
+                                 qvalueCutoff = 0.05, 
+                                 readable = TRUE)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de barras con las funciones genéricas sobreexpresadas en NIT vs ELI con enrichGO()."}
+
+barplot(ego_up_NE, showCategory = 18, cex.names = 0.06)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de puntos con las funciones genéricas sobreexpresadas en NIT vs ELI con enrichGO()."}
+
+clusterProfiler::dotplot(ego_up_NE, showCategory = 18)
+
+```
+
+#### Down-regulated
+
+```{r, echo = FALSE}
+
+# down-regulated
+
+genes_down_annotated_NE_go <- as.character(
+  na.omit(genes_down_annotated_NE$ENTREZID))
+
+ggo_down_NE <- clusterProfiler::groupGO(gene = genes_down_annotated_NE_go,
+                                OrgDb = org.Hs.eg.db ,
+                                ont = "BP",
+                                level = 3,
+                                readable = TRUE)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de barras con las funciones genéricas infraexpresadas en NIT vs ELI con groupGO()."}
+
+barplot(ggo_down_NE, drop=TRUE, showCategory=12)
+
+```
+
+```{r, echo = FALSE}
+
+ego_down_NE <- clusterProfiler::enrichGO(
+                                 gene = genes_down_annotated_NE_go,
+                                 OrgDb = org.Hs.eg.db,
+                                 ont = "BP",
+                                 pAdjustMethod = "BH",
+                                 pvalueCutoff = 0.05,
+                                 qvalueCutoff = 0.05, 
+                                 readable = TRUE)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de barras con las funciones genéricas infraexpresadas en NIT vs ELI con enrichGO()."}
+
+barplot(ego_down_NE, showCategory = 18, cex.names = 0.06)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de puntos con las funciones genéricas infraexpresadas en NIT vs ELI con enrichGO()."}
+
+clusterProfiler::dotplot(ego_down_NE, showCategory = 18)
+
+```
+
+### SFI vs ELI
+
+
+#### Up-regulated
+
+```{r, echo = FALSE}
+
+# Up-regulated - groupGO
+genes_up_annotated_SE_go <- as.character(
+  na.omit(genes_up_annotated_SE$ENTREZID))
+
+ggo_up_SE <- clusterProfiler::groupGO(gene = genes_up_annotated_SE_go,
+                                OrgDb = org.Hs.eg.db ,
+                                ont = "BP",
+                                level = 3,
+                                readable = TRUE)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de barras con las funciones genéricas sobreexpresadas en SFI vs ELI con groupGO()."}
+
+barplot(ggo_up_SE, drop=TRUE, showCategory=12)
+
+```
+
+```{r, echo = FALSE}
+
+# Up-regulated - enrichGO
+ego_up_SE <- clusterProfiler::enrichGO(
+                                 gene = genes_up_annotated_SE_go,
+                                 OrgDb = org.Hs.eg.db,
+                                 ont = "BP",
+                                 pAdjustMethod = "BH",
+                                 pvalueCutoff = 0.05,
+                                 qvalueCutoff = 0.05, 
+                                 readable = TRUE)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de barras con las funciones genéricas sobreexpresadas en SFI vs ELI con enrichGO()."}
+
+barplot(ego_up_SE, showCategory = 18, cex.names = 0.06)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de puntos con las funciones genéricas sobreexpresadas en SFI vs ELI con enrichGO()."}
+
+clusterProfiler::dotplot(ego_up_SE, showCategory = 18)
+
+```
+
+#### Down-regulated
+
+```{r, echo = FALSE}
+
+# down-regulated
+
+genes_down_annotated_SE_go <- as.character(
+  na.omit(genes_down_annotated_SE$ENTREZID))
+
+ggo_down_SE <- clusterProfiler::groupGO(gene = genes_down_annotated_SE_go,
+                                OrgDb = org.Hs.eg.db ,
+                                ont = "BP",
+                                level = 3,
+                                readable = TRUE)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de barras con las funciones genéricas infraexpresadas en SFI vs ELI con groupGO()."}
+
+barplot(ggo_down_SE, drop=TRUE, showCategory=12)
+
+```
+
+```{r, echo = FALSE}
+
+ego_down_SE <- clusterProfiler::enrichGO(
+                                 gene = genes_down_annotated_SE_go,
+                                 OrgDb = org.Hs.eg.db,
+                                 ont = "BP",
+                                 pAdjustMethod = "BH",
+                                 pvalueCutoff = 0.05,
+                                 qvalueCutoff = 0.05, 
+                                 readable = TRUE)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de barras con las funciones genéricas infraexpresadas en SFI vs ELI con enrichGO()."}
+
+barplot(ego_down_SE, showCategory = 18, cex.names = 0.06)
+
+```
+
+```{r, echo = FALSE, fig.show="hold", fig.align="center", fig.height=3.5, fig.cap="Gráfico de puntos con las funciones genéricas infraexpresadas en SFI vs ELI con enrichGO()."}
+
+clusterProfiler::dotplot(ego_down_SE, showCategory = 18)
+
+```
+
+# Discusión 
+
+## Apreciaciones generales de los resultados 
+
+Para poder interpretar los resultados, sería conveniente tener un background biológico que permitisiese evaluar los resultados. No obstante, se puede sacar ciertas apreciaciones de las tablas obtenidas:
+
+* Las muestras NIT y SFI son bastante similares.
+
+* La comparación que resulta más fuerte es la de los grupos NIT y ELI (tiene sentido pues SFI es algo así como un grupo intermedio)
+
+* Los resultados del análisis NIT y ELI parecen tener sentido
+  + En NIT, donde no ha habido infiltración linfocitaria, están más expresados genes de biosíntesis en general
+  + En SFI, donde ha habido una infiltración linfocitaria extensa, están más expresados genes de activación de células T, adhesión de leucocitos o regulación de linfocitos.
+
+## Puntos a mejorar/modificar
+
+Existen algunas mejoras/modificaciones que sería interesante comentar. Algunas de ellas ya han sido comentadas en sus correspondientes apartados, pero considero de interés mostrarlas agrupadas por tener un enfoque general de los cambios que podrían realizarse.
+
+- **Tener el artículo original**: Al no tener el origen de los datos, resulta difícil tomar decisiones tanto por no saber por dónde enfocar el análisis como no saber qué buscan los investigadores con estos datos. Un ejemplo de esto sería que, en la tabla targets, la variable `molecular_data_type` presenta como opciones Allele-Specific Expression y RNA Seq (NGS), pero ninguna de las dos tiene muestra suficiente para tomar una sola en el estudio, por lo que, ante la duda de cuál de los dos tomar, se ha decidido usarlas de forma indistinta.
+
+- **Parámetros de filtro**: Podrían filtrarse los p-valor ajustados o los logFC según se quiera un análisis más o menos laxo. 
+
+- **Función lfcShrink()**: En los cálculos de expresión diferencial de genes, no altera la cantidad de genes detectados, pero sí ajusta el logFC de aquellos con conteos bajos. No se ha aplicado, pero podría ser interesante una comparación entre llevar o no a cabo esta función.
+
+- **La unión hace la fuerza**: Existen múltiples paquetes de R que permiten identificar qué genes están expresados de forma diferencial entre dos conjuntos de muestra. En este caso se han empleado las herramientas del paquete `DESeq`, pero otra posibilidad habría sido  `edgeR`. Se podría plantear, para un estudio muy restrictivo, el uso de ambas y tomar solo los genes que resulten efectivos en ambas, siendo estos más seguros por tener dos evidencias que los señalan. 
+
+- **Análisis NIT & SFI vs ELI**: La falta de diferencias significativas entre estas dos muestras, podrían plantear un análisis conjunto de estas muestras frente al otro grupo. 
+
+- **NA en anotaciones**: Parece ser que cerca de la mitad de los genes analizados no estaban presentes en la el paquete empleado para asociar las anotaciones. Podría ser un problema de la nomenclatura de la muestra o podría plantearse utilizar otro paquete que pudiese recoger mejor el total de información.
+
+- **Exportación de datos**: Se ha generado gran cantidad de tablas, en algún momento podría ser interesante exportar alguna de la información recogida para tener un listado extenso (Como podría ser recoger en un Excel la información de los genes up-regulated entre NIT y ELI).
+
+
+
+
+
